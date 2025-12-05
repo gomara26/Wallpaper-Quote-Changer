@@ -6,6 +6,7 @@ Randomly selects a quote and sets it as the macOS wallpaper.
 
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -40,7 +41,18 @@ DEFAULT_HEIGHT = 1440
 
 
 def get_screen_resolution():
-    """Get the current screen resolution using system_profiler."""
+    """Get the current screen resolution using system_profiler.
+    Returns a single display resolution (for backward compatibility)."""
+    displays = get_all_displays()
+    if displays:
+        return displays[0]['width'], displays[0]['height']
+    return DEFAULT_WIDTH, DEFAULT_HEIGHT
+
+
+def get_all_displays():
+    """Get all connected displays and their resolutions.
+    Returns a list of dicts with 'width', 'height', and 'name' keys."""
+    displays = []
     try:
         result = subprocess.run(
             ["system_profiler", "SPDisplaysDataType"],
@@ -48,15 +60,77 @@ def get_screen_resolution():
             text=True,
             check=True
         )
-        # Try to parse resolution from output
+        
+        current_display = {}
+        in_displays_section = False
+        previous_line = None
+        previous_indent = 0
+        
         for line in result.stdout.split('\n'):
-            if 'Resolution:' in line:
-                parts = line.split('Resolution:')[1].strip().split('x')
-                if len(parts) == 2:
-                    return int(parts[0].strip()), int(parts[1].strip())
-    except Exception:
-        pass
-    return DEFAULT_WIDTH, DEFAULT_HEIGHT
+            stripped = line.strip()
+            # Count leading spaces to determine indentation level
+            indent_level = len(line) - len(line.lstrip())
+            
+            # Look for "Displays:" section
+            if stripped == 'Displays:':
+                in_displays_section = True
+                previous_line = None
+                previous_indent = 0
+                continue
+            
+            # If we're in the Displays section
+            if in_displays_section:
+                # Look for Resolution line (usually indented under display name)
+                if 'Resolution:' in stripped:
+                    # The display name should be the previous line that ends with ':'
+                    # and is at a similar or less indented level
+                    if previous_line and previous_line.strip().endswith(':'):
+                        display_name = previous_line.strip().rstrip(':').strip()
+                        if display_name:
+                            # Save previous display if it has resolution
+                            if current_display and 'width' in current_display:
+                                displays.append(current_display)
+                            # Start new display
+                            current_display = {'name': display_name}
+                    
+                    # Parse resolution: "3440 x 1440" or "3840 x 2160"
+                    # Extract numbers from the resolution string
+                    # Match pattern like "3440 x 1440" or "3840x2160"
+                    match = re.search(r'(\d+)\s*x\s*(\d+)', stripped, re.IGNORECASE)
+                    if match:
+                        try:
+                            current_display['width'] = int(match.group(1))
+                            current_display['height'] = int(match.group(2))
+                        except ValueError:
+                            pass
+                    previous_line = None  # Reset after processing resolution
+                    continue
+                
+                # Track previous line for display name detection
+                # Only track lines that end with ':' and are at display name indent level (8-10 spaces)
+                if stripped and stripped.endswith(':') and 8 <= indent_level <= 12:
+                    previous_line = line  # Keep original line with indentation info
+                    previous_indent = indent_level
+                elif indent_level < 8 and stripped:
+                    # If we hit a less-indented line, we might be leaving the Displays section
+                    if current_display and 'width' in current_display:
+                        displays.append(current_display)
+                        current_display = {}
+                    in_displays_section = False
+                    previous_line = None
+        
+        # Don't forget the last display
+        if current_display and 'width' in current_display:
+            displays.append(current_display)
+            
+    except Exception as e:
+        print(f"Warning: Could not detect displays ({e}), using default")
+    
+    # If no displays found, return default
+    if not displays:
+        displays = [{'name': 'Default Display', 'width': DEFAULT_WIDTH, 'height': DEFAULT_HEIGHT}]
+    
+    return displays
 
 
 def load_quotes():
@@ -251,38 +325,78 @@ def create_wallpaper(quotes, width, height):
 
 
 def cleanup_old_wallpapers():
-    """Clean up old wallpaper files, keeping only the 5 most recent."""
+    """Clean up old wallpaper files, keeping only the 5 most recent per display."""
     try:
-        wallpaper_files = sorted(
-            WALLPAPER_DIR.glob("wallpaper_*.jpg"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True
-        )
-        # Keep only the 5 most recent
-        for old_file in wallpaper_files[5:]:
-            try:
-                old_file.unlink()
-            except:
-                pass
+        # Get all wallpaper files
+        all_wallpapers = list(WALLPAPER_DIR.glob("wallpaper*.jpg"))
+        
+        # Group by display (if multi-monitor) or keep all together
+        display_groups = {}
+        for wp in all_wallpapers:
+            # Extract display number from filename (wallpaper_display1_*.jpg or wallpaper_*.jpg)
+            if '_display' in wp.name:
+                try:
+                    display_num = int(wp.name.split('_display')[1].split('_')[0])
+                    if display_num not in display_groups:
+                        display_groups[display_num] = []
+                    display_groups[display_num].append(wp)
+                except:
+                    # Fallback for old format
+                    if 'all' not in display_groups:
+                        display_groups['all'] = []
+                    display_groups['all'].append(wp)
+            else:
+                # Old format (wallpaper_*.jpg) - treat as single group
+                if 'all' not in display_groups:
+                    display_groups['all'] = []
+                display_groups['all'].append(wp)
+        
+        # Clean up each group, keeping 5 most recent
+        for display_key, wallpapers in display_groups.items():
+            sorted_wallpapers = sorted(
+                wallpapers,
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            # Keep only the 5 most recent per display
+            for old_file in sorted_wallpapers[5:]:
+                try:
+                    old_file.unlink()
+                except:
+                    pass
     except Exception:
         pass  # Don't fail if cleanup doesn't work
 
 
-def set_wallpaper(image_path):
-    """Set the wallpaper on macOS using osascript and force refresh."""
+def set_wallpaper(image_path, desktop_index=None):
+    """Set the wallpaper on macOS using osascript and force refresh.
+    
+    Args:
+        image_path: Path to the wallpaper image
+        desktop_index: Optional desktop index (1-based). If None, sets for all desktops.
+    """
     # Convert path to POSIX path format
     posix_path = str(Path(image_path).absolute())
     
-    # Method 1: Set wallpaper and force refresh
-    script1 = f'''tell application "System Events"
+    if desktop_index is not None:
+        # Set wallpaper for specific desktop
+        script = f'''tell application "System Events"
+    tell desktop {desktop_index}
+        set picture to POSIX file "{posix_path}"
+    end tell
+end tell'''
+    else:
+        # Set wallpaper for all desktops (backward compatibility)
+        script = f'''tell application "System Events"
     tell every desktop
         set picture to POSIX file "{posix_path}"
     end tell
 end tell'''
     
+    # Method 1: Direct approach
     try:
         result = subprocess.run(
-            ["osascript", "-e", script1],
+            ["osascript", "-e", script],
             check=True,
             capture_output=True,
             text=True,
@@ -293,7 +407,10 @@ end tell'''
         
         # Small delay to ensure file is written
         time.sleep(0.3)
-        print("✓ Wallpaper set successfully!")
+        if desktop_index is not None:
+            print(f"✓ Wallpaper set successfully for display {desktop_index}!")
+        else:
+            print("✓ Wallpaper set successfully!")
         
         return True
     except subprocess.TimeoutExpired:
@@ -304,9 +421,10 @@ end tell'''
     except Exception as e:
         print(f"⚠ Method 1 error: {e}")
     
-    # Method 2: Try with explicit desktop iteration
-    try:
-        script2 = f'''tell application "System Events"
+    # Method 2: Try with explicit desktop iteration (for all desktops only)
+    if desktop_index is None:
+        try:
+            script2 = f'''tell application "System Events"
     set desktopCount to count of desktops
     repeat with i from 1 to desktopCount
         tell desktop i
@@ -314,26 +432,34 @@ end tell'''
         end tell
     end repeat
 end tell'''
-        result = subprocess.run(
-            ["osascript", "-e", script2],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.stderr and "error" in result.stderr.lower():
-            raise subprocess.CalledProcessError(1, "osascript", result.stderr)
-        
-        # Small delay to ensure file is written
-        time.sleep(0.3)
-        print("✓ Wallpaper set successfully (method 2)!")
-        return True
-    except Exception as e:
-        print(f"⚠ Method 2 failed: {e}")
+            result = subprocess.run(
+                ["osascript", "-e", script2],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.stderr and "error" in result.stderr.lower():
+                raise subprocess.CalledProcessError(1, "osascript", result.stderr)
+            
+            # Small delay to ensure file is written
+            time.sleep(0.3)
+            print("✓ Wallpaper set successfully (method 2)!")
+            return True
+        except Exception as e:
+            print(f"⚠ Method 2 failed: {e}")
     
     # Method 3: Try using alias approach
     try:
-        script3 = f'''set theFile to POSIX file "{posix_path}" as alias
+        if desktop_index is not None:
+            script3 = f'''set theFile to POSIX file "{posix_path}" as alias
+tell application "System Events"
+    tell desktop {desktop_index}
+        set picture to theFile
+    end tell
+end tell'''
+        else:
+            script3 = f'''set theFile to POSIX file "{posix_path}" as alias
 tell application "System Events"
     tell every desktop
         set picture to theFile
@@ -351,13 +477,17 @@ end tell'''
         
         # Small delay to ensure file is written
         time.sleep(0.3)
-        print("✓ Wallpaper set successfully (method 3)!")
+        if desktop_index is not None:
+            print(f"✓ Wallpaper set successfully for display {desktop_index} (method 3)!")
+        else:
+            print("✓ Wallpaper set successfully (method 3)!")
         return True
     except Exception as e:
         print(f"⚠ Method 3 failed: {e}")
     
     # If all methods fail, provide manual instructions
-    print(f"\n⚠ Could not set wallpaper automatically.")
+    display_info = f" for display {desktop_index}" if desktop_index is not None else ""
+    print(f"\n⚠ Could not set wallpaper automatically{display_info}.")
     print(f"Image saved to: {posix_path}")
     print(f"\nTo set it manually:")
     print(f"1. Open Finder")
@@ -368,57 +498,81 @@ end tell'''
 
 
 def main():
-    """Main function to change wallpaper."""
+    """Main function to change wallpaper with multi-monitor support."""
     print("Changing wallpaper...")
     
     # Load quotes
     quotes_list = load_quotes()
     
-    # Select random quote(s) - each entry can be a single quote or multiple quotes
-    selected_quotes = random.choice(quotes_list)
+    # Get all displays
+    displays = get_all_displays()
+    print(f"\nDetected {len(displays)} display(s):")
+    for i, display in enumerate(displays, 1):
+        print(f"  Display {i}: {display['name']} ({display['width']}x{display['height']})")
     
-    # Display what was selected
-    if len(selected_quotes) == 1:
-        print(f"Selected quote: {selected_quotes[0][:50]}...")
+    # Select different random quotes for each display
+    # Use random.sample to ensure no duplicate quotes if we have fewer displays than quotes
+    if len(quotes_list) >= len(displays):
+        selected_quotes_list = random.sample(quotes_list, len(displays))
     else:
-        print(f"Selected {len(selected_quotes)} quotes:")
-        for q in selected_quotes:
-            print(f"  - {q[:50]}...")
+        # If we have more displays than quotes, allow repeats
+        selected_quotes_list = [random.choice(quotes_list) for _ in range(len(displays))]
     
-    # Get screen resolution
-    width, height = get_screen_resolution()
-    print(f"Creating wallpaper at {width}x{height}")
+    # Process each display
+    wallpaper_paths = []
+    for display_idx, display in enumerate(displays, 1):
+        selected_quotes = selected_quotes_list[display_idx - 1]
+        
+        # Display what was selected for this display
+        print(f"\n--- Display {display_idx} ({display['name']}) ---")
+        if len(selected_quotes) == 1:
+            print(f"Selected quote: {selected_quotes[0][:80]}...")
+        else:
+            print(f"Selected {len(selected_quotes)} quotes:")
+            for q in selected_quotes:
+                print(f"  - {q[:80]}...")
+        
+        # Create wallpaper for this display
+        width, height = display['width'], display['height']
+        print(f"Creating wallpaper at {width}x{height}")
+        
+        image = create_wallpaper(selected_quotes, width, height)
+        
+        # Save image with display-specific filename
+        timestamp = int(time.time())
+        output_image = WALLPAPER_DIR / f"wallpaper_display{display_idx}_{timestamp}.jpg"
+        image.save(output_image, "JPEG", quality=95)
+        print(f"Wallpaper saved to {output_image}")
+        
+        wallpaper_paths.append((display_idx, str(output_image.absolute())))
     
-    # Create wallpaper
-    image = create_wallpaper(selected_quotes, width, height)
+    # Set wallpapers for each display
+    print(f"\n--- Setting Wallpapers ---")
+    for display_idx, image_path in wallpaper_paths:
+        if not os.path.exists(image_path):
+            print(f"ERROR: Image file does not exist at {image_path}")
+            continue
+        
+        print(f"\nSetting wallpaper for display {display_idx}...")
+        set_wallpaper(image_path, desktop_index=display_idx)
     
-    # Save image
-    image.save(OUTPUT_IMAGE, "JPEG", quality=95)
-    print(f"Wallpaper saved to {OUTPUT_IMAGE}")
-    
-    # Create/update symlink for easy access
-    if SYMLINK_IMAGE.exists() or SYMLINK_IMAGE.is_symlink():
+    # Create/update symlink for the first display (for backward compatibility)
+    if wallpaper_paths:
+        first_image_path = Path(wallpaper_paths[0][1])
+        if SYMLINK_IMAGE.exists() or SYMLINK_IMAGE.is_symlink():
+            try:
+                SYMLINK_IMAGE.unlink()
+            except:
+                pass
         try:
-            SYMLINK_IMAGE.unlink()
+            SYMLINK_IMAGE.symlink_to(first_image_path)
         except:
-            pass
-    try:
-        SYMLINK_IMAGE.symlink_to(OUTPUT_IMAGE)
-    except:
-        pass  # Symlink creation is optional
+            pass  # Symlink creation is optional
     
-    # Set wallpaper
-    image_path = str(OUTPUT_IMAGE.absolute())
-    print(f"Attempting to set wallpaper from: {image_path}")
-    if not os.path.exists(image_path):
-        print(f"ERROR: Image file does not exist at {image_path}")
-        sys.exit(1)
-    
-    # Clean up old wallpapers (keep only last 5)
+    # Clean up old wallpapers (keep only last 5 per display)
     cleanup_old_wallpapers()
     
-    # Set the new wallpaper
-    set_wallpaper(image_path)
+    print(f"\n✓ All wallpapers updated!")
 
 
 if __name__ == "__main__":
