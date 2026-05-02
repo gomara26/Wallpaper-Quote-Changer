@@ -4,6 +4,7 @@ Mac Wallpaper Quote Changer
 Randomly selects a quote and sets it as the macOS wallpaper.
 """
 
+import json
 import os
 import random
 import re
@@ -39,6 +40,14 @@ SHADOW_COLOR = (0, 0, 0)  # Black shadow (for readability)
 DEFAULT_WIDTH = 2560
 DEFAULT_HEIGHT = 1440
 
+# Cache files: skip slow `system_profiler` and JPEG resize on every run.
+DISPLAY_CACHE_FILE = WALLPAPER_DIR / "displays_cache.json"
+DISPLAY_CACHE_TTL = 24 * 60 * 60  # 1 day; displays rarely change
+
+
+def _bg_cache_path(width, height):
+    return WALLPAPER_DIR / f"bg_cache_{width}x{height}.jpg"
+
 
 def get_screen_resolution():
     """Get the current screen resolution using system_profiler.
@@ -52,6 +61,17 @@ def get_screen_resolution():
 def get_all_displays():
     """Get all connected displays and their resolutions.
     Returns a list of dicts with 'width', 'height', and 'name' keys."""
+    # Try cache first — system_profiler call below takes 2–5s.
+    try:
+        if DISPLAY_CACHE_FILE.exists():
+            age = time.time() - DISPLAY_CACHE_FILE.stat().st_mtime
+            if age < DISPLAY_CACHE_TTL:
+                cached = json.loads(DISPLAY_CACHE_FILE.read_text())
+                if cached:
+                    return cached
+    except Exception:
+        pass
+
     displays = []
     try:
         result = subprocess.run(
@@ -129,7 +149,12 @@ def get_all_displays():
     # If no displays found, return default
     if not displays:
         displays = [{'name': 'Default Display', 'width': DEFAULT_WIDTH, 'height': DEFAULT_HEIGHT}]
-    
+    else:
+        try:
+            DISPLAY_CACHE_FILE.write_text(json.dumps(displays))
+        except Exception:
+            pass
+
     return displays
 
 
@@ -193,34 +218,46 @@ def create_wallpaper(quotes, width, height):
     # Load background image if specified, otherwise create gradient
     if BACKGROUND_IMAGE and Path(BACKGROUND_IMAGE).exists():
         try:
-            # Load and resize background image
-            bg = Image.open(BACKGROUND_IMAGE)
-            # Resize to cover the screen (maintain aspect ratio, crop if needed)
-            bg_ratio = bg.width / bg.height
-            screen_ratio = width / height
-            
-            if bg_ratio > screen_ratio:
-                # Background is wider - fit to height
-                new_height = height
-                new_width = int(bg.width * (height / bg.height))
+            # Cache the resized+overlaid background per resolution. The LANCZOS
+            # resize and alpha_composite are the slowest steps after
+            # system_profiler — skip them when the cache is up to date.
+            cache_path = _bg_cache_path(width, height)
+            src_mtime = Path(BACKGROUND_IMAGE).stat().st_mtime
+            cache_fresh = (
+                cache_path.exists()
+                and cache_path.stat().st_mtime >= src_mtime
+            )
+
+            if cache_fresh:
+                image = Image.open(cache_path).convert('RGB')
             else:
-                # Background is taller - fit to width
-                new_width = width
-                new_height = int(bg.height * (width / bg.width))
-            
-            bg = bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # Create canvas and paste background (centered, cropping if needed)
-            image = Image.new('RGB', (width, height), color=(0, 0, 0))
-            x_offset = (width - new_width) // 2
-            y_offset = (height - new_height) // 2
-            image.paste(bg, (x_offset, y_offset))
-            
-            # Add a semi-transparent dark overlay for better text readability
-            overlay = Image.new('RGBA', (width, height), (0, 0, 0, 100))  # 100/255 opacity
-            image_rgba = image.convert('RGBA')
-            image = Image.alpha_composite(image_rgba, overlay).convert('RGB')
-            
+                bg = Image.open(BACKGROUND_IMAGE)
+                bg_ratio = bg.width / bg.height
+                screen_ratio = width / height
+
+                if bg_ratio > screen_ratio:
+                    new_height = height
+                    new_width = int(bg.width * (height / bg.height))
+                else:
+                    new_width = width
+                    new_height = int(bg.height * (width / bg.width))
+
+                bg = bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+                image = Image.new('RGB', (width, height), color=(0, 0, 0))
+                x_offset = (width - new_width) // 2
+                y_offset = (height - new_height) // 2
+                image.paste(bg, (x_offset, y_offset))
+
+                overlay = Image.new('RGBA', (width, height), (0, 0, 0, 100))
+                image_rgba = image.convert('RGBA')
+                image = Image.alpha_composite(image_rgba, overlay).convert('RGB')
+
+                try:
+                    image.save(cache_path, "JPEG", quality=90)
+                except Exception:
+                    pass
+
             draw = ImageDraw.Draw(image)
         except Exception as e:
             print(f"Warning: Could not load background image ({e}), using gradient instead")
